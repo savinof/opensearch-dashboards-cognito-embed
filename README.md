@@ -34,7 +34,7 @@ The solution uses various AWS services to provide a seamless and secure experien
 
 1. Clone the repository:
    ```
-   git clone https://github.com/savinof/embed-opensearch-dashboards-cognito.git
+   git clone https://github.com/savinof/opensearch-dashboards-cognito-embed.git
    cd embed-opensearch-dashboards-cognito
    ```
 
