@@ -1,0 +1,892 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  This SAM app embeds OpenSearch Dashboards iFrame into a website using the same Cognito auth. It extends cloudfront-authorization-at-edge repo with custom logic for OpenSearch Dashboards integration. 
+  (https://github.com/aws-samples/cloudfront-authorization-at-edge)
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 128
+    Runtime: python3.12
+    Handler: lambda.handler
+
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: Enter email address, this will create a user in Cognito User Pool
+    Default: "example@mail.com"
+  SemanticVersion:
+    Type: String
+    Description: Semantic version of cloudfront-authorization-at-edge (https://github.com/aws-samples/cloudfront-authorization-at-edge)
+    Default: 2.2.2
+  OAuthScopes:
+    Type: CommaDelimitedList
+    Description: The OAuth scopes to request the User Pool to add to the access token JWT
+    Default: "phone, email, profile, openid"
+  HttpHeaderss:
+    Type: String
+    Description: The HTTP headers to set on all responses from CloudFront. Defaults are illustrations only and contain a report-only Cloud Security Policy -- adjust for your application
+    Default: >-
+      {
+        "Content-Security-Policy": "default-src 'self' data:; img-src 'self' data: https://*.aws.a2z.com; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline' 'self'; object-src 'none'; worker-src blob: 'self'; connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com https://*.aws.a2z.com",
+        "Strict-Transport-Security": "max-age=31536000; includeSubdomains; preload",
+        "Referrer-Policy": "same-origin",
+        "X-XSS-Protection": "1; mode=block",
+        "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff"
+      }
+  Nonce:
+    Type: String
+    Description: Nonce will trigger deployment of OpensearchHeadersHandler every time
+  WebACLId:
+    Description: AWS WAF Web ACL Id, if any, to associate with this distribution
+    Type: String
+    Default: ""
+  CloudFrontAccessLogsBucket:
+    Description: The (pre-existing) Amazon S3 bucket to store CloudFront access logs in, for example, myawslogbucket.s3.amazonaws.com.
+    Type: String
+    Default: ""
+  EnableOpensearchAuditLogs:
+    Type: String
+    Description: Set to 'false' to disable Opensearch Audit logs
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+  EnableSPAMode:
+    Type: String
+    Description: Set to 'false' to disable SPA-specific features (i.e. when deploying a static site that won't interact with logout/refresh)
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID to deploy the OpenSearch domain into
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 1 ID
+  PrivateSubnet2: 
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 2 ID
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type
+  CertificateARN:
+    Type: String
+    Description: ARN of the ACM certificate
+
+Conditions:
+  UseWAF: !Not [!Equals [!Ref WebACLId, ""]]
+  CloudFrontAccessLogsBucketProvided:
+    !Not [!Equals [!Ref CloudFrontAccessLogsBucket, ""]]
+  OpensearchAuditLogs: !Equals [!Ref EnableOpensearchAuditLogs, "true"]
+  SPAMode: !Equals [!Ref EnableSPAMode, "true"]
+
+Resources:
+  WebsiteContentBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18:Bucket contains the website, no need of access logs
+    # checkov:skip=CKV_AWS_21:Bucket contains the website, no need of versioning
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "Bucket contains the website, no need of access logs"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LambdaEdgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - edgelambda.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  OpensearchHeadersHandler:
+    Type: AWS::Serverless::Function
+    # checkov:skip=CKV_AWS_117:lambda doesn't have to communicate with private resources
+    # checkov:skip=CKV_AWS_115:not for production deployment
+    # checkov:skip=CKV_AWS_116:lambda doesn't process data, error doesn't have to be handled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "lambda doesn't have to communicate with private resources"
+          - id: W92
+            reason: "not for production deployment"
+          - id: W58
+            reason: "cloudwatch permission are allowed in AWSLambdaBasicExecutionRole"
+    Properties:
+      CodeUri: src/lambda-edge/opensearch-headers/
+      Role: !GetAtt LambdaEdgeExecutionRole.Arn
+      Timeout: 5
+
+  OpensearchHeadersHandlerVersion:
+    Type: Custom::OpensearchHeadersHandlerVersion
+    # checkov:skip=CKV_AWS_117:lambda doesn't have to communicate with private resources
+    # checkov:skip=CKV_AWS_115:not for production deployment
+    # checkov:skip=CKV_AWS_116:lambda doesn't process data, error doesn't have to be handled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "lambda doesn't have to communicate with private resources"
+          - id: W92
+            reason: "not for production deployment"
+    Properties:
+      ServiceToken: !GetAtt PublishOpensearchHeadersHandler.Arn
+      OpensearchHeadersHandler: !Ref OpensearchHeadersHandler
+      Nonce: !Ref Nonce
+
+  PublishOpensearchHeadersHandler:
+    Type: AWS::Serverless::Function
+    # checkov:skip=CKV_AWS_117:lambda doesn't have to communicate with private resources
+    # checkov:skip=CKV_AWS_115:not for production deployment
+    # checkov:skip=CKV_AWS_116:lambda doesn't process data, error doesn't have to be handled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "lambda doesn't have to communicate with private resources"
+          - id: W92
+            reason: "not for production deployment"
+    Properties:
+      CodeUri: src/cfn-custom-resources/publish-opensearch-headers-handler
+      Role: !GetAtt PublishLambdaFunctionExecutionRole.Arn
+
+  PublishLambdaFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PublishVersion
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:PublishVersion
+                Resource: !GetAtt OpensearchHeadersHandler.Arn
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    # checkov:skip=CKV_AWS_86:access log enabled by user with condition "CloudFrontAccessLogsBucketProvided"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W70
+            reason: "enforced tls version but still getting the warning"
+    DependsOn:
+      - OriginAccessControl
+      - LambdaEdgeProtection
+      - OpensearchDomain
+      - OpensearchHeadersHandlerVersion
+      - EC2Proxy
+    Properties:
+      DistributionConfig:
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2018
+        CacheBehaviors:
+          - PathPattern: /parseauth
+            Compress: true
+            ForwardedValues:
+              QueryString: true
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                LambdaFunctionARN: !GetAtt LambdaEdgeProtection.Outputs.ParseAuthHandler
+            TargetOriginId: dummy-origin
+            ViewerProtocolPolicy: redirect-to-https
+          - PathPattern: /refreshauth
+            Compress: true
+            ForwardedValues:
+              QueryString: true
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                LambdaFunctionARN: !GetAtt LambdaEdgeProtection.Outputs.RefreshAuthHandler
+            TargetOriginId: dummy-origin
+            ViewerProtocolPolicy: redirect-to-https
+          - PathPattern: /signout
+            Compress: true
+            ForwardedValues:
+              QueryString: true
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                LambdaFunctionARN: !GetAtt LambdaEdgeProtection.Outputs.SignOutHandler
+            TargetOriginId: dummy-origin
+            ViewerProtocolPolicy: redirect-to-https
+          - PathPattern: /_dashboards/*
+            TargetOriginId: proxy-origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            ForwardedValues:
+              QueryString: true
+              Cookies:
+                Forward: all
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                LambdaFunctionARN: !GetAtt LambdaEdgeProtection.Outputs.CheckAuthHandler
+              - EventType: origin-response
+                LambdaFunctionARN: !GetAtt OpensearchHeadersHandlerVersion.FunctionArn
+        DefaultCacheBehavior:
+          Compress: true
+          ForwardedValues:
+            QueryString: true
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !GetAtt LambdaEdgeProtection.Outputs.CheckAuthHandler
+            - EventType: origin-request
+              LambdaFunctionARN: !GetAtt LambdaEdgeProtection.Outputs.TrailingSlashHandler
+            - EventType: origin-response
+              LambdaFunctionARN: !GetAtt LambdaEdgeProtection.Outputs.HttpHeadersHandler
+          TargetOriginId: protected-origin
+          ViewerProtocolPolicy: redirect-to-https
+        Enabled: true
+        DefaultRootObject: index.html
+        WebACLId: !If
+          - UseWAF
+          - !Ref WebACLId
+          - !Ref AWS::NoValue
+        Logging: !If
+          - CloudFrontAccessLogsBucketProvided
+          - Bucket: !Ref CloudFrontAccessLogsBucket
+          - !Ref AWS::NoValue
+        Origins:
+          - Id: protected-origin
+            DomainName: !GetAtt WebsiteContentBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - DomainName: will-never-be-reached.org
+            Id: dummy-origin
+            CustomOriginConfig:
+              OriginProtocolPolicy: match-viewer
+              OriginSSLProtocols: [TLSv1.2]
+          - DomainName: !GetAtt EC2Proxy.PublicDnsName
+            Id: proxy-origin
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        CustomErrorResponses:
+          - !If
+            - SPAMode # In SPA mode, 404's from S3 should return index.html, to enable SPA routing
+            - ErrorCode: 404
+              ResponseCode: 200
+              ResponsePagePath: /index.html
+            - !Ref AWS::NoValue
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: S3 Origin Access Control
+        Name:
+          !Join [
+            "-",
+            [
+              "oac-s3",
+              !Select [
+                4,
+                !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+              ],
+            ],
+          ]
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: "CloudFront OAI"
+
+  CloudfrontBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteContentBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "s3:GetObject"
+            Effect: "Allow"
+            Resource: !Join ["/", [!GetAtt WebsiteContentBucket.Arn, "*"]]
+            Principal:
+              Service:
+                - "cloudfront.amazonaws.com"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+          - Action:
+              - "s3:ListBucket"
+            Effect: "Allow"
+            Resource: !GetAtt WebsiteContentBucket.Arn
+            Principal:
+              Service:
+                - "cloudfront.amazonaws.com"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  GetCognitoClientFunction:
+    Type: AWS::Serverless::Function
+    # checkov:skip=CKV_AWS_117:lambda doesn't have to communicate with private resources
+    # checkov:skip=CKV_AWS_115:not for production deployment
+    # checkov:skip=CKV_AWS_116:lambda doesn't process data, error doesn't have to be handled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "lambda doesn't have to communicate with private resources"
+          - id: W92
+            reason: "not for production deployment"
+    Properties:
+      CodeUri: src/cfn-custom-resources/cognito-client-retrieval
+      Policies:
+        - AmazonCognitoPowerUser
+
+  GetCognitoClient:
+    Type: Custom::GetCognitoClient
+    DependsOn: OpensearchDomain
+    Properties:
+      ServiceToken: !GetAtt GetCognitoClientFunction.Arn
+      UserPoolId: !Ref UserPool
+
+  SNSRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111:This is how the wizard creates it, it seems there is no way to restric to a topic when sending sms
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "This is how the wizard creates it, it seems there is no way to restric to a topic when sending sms"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "cognito-idp.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref "AWS::StackName"
+      Policies:
+        - PolicyName: "CognitoSNSPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: "*"
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName:
+        !Join [
+          "-",
+          [
+            "user-pool",
+            !Select [
+              4,
+              !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+            ],
+          ],
+        ]
+      MfaConfiguration: "ON"
+      AutoVerifiedAttributes:
+        - email
+        - phone_number
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: True
+      UsernameAttributes:
+        - email
+      SmsConfiguration:
+        ExternalId: !Ref "AWS::StackName"
+        SnsCallerArn: !GetAtt SNSRole.Arn
+
+  User:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      Username: !Ref EmailAddress
+      UserPoolId: !Ref UserPool
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub
+        - "auth-${StackIdSuffix}"
+        - StackIdSuffix: !Select
+            - 2
+            - !Split
+              - "/"
+              - !Ref AWS::StackId
+      UserPoolId: !Ref UserPool
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      AllowUnauthenticatedIdentities: false
+      IdentityPoolName:
+        !Join [
+          "-",
+          [
+            "identity-pool",
+            !Select [
+              4,
+              !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+            ],
+          ],
+        ]
+
+  CognitoAuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action: "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": "authenticated"
+      Path: "/"
+      Policies:
+        - PolicyName:
+            !Join [
+              "-",
+              [
+                "authenticated-role",
+                !Select [
+                  4,
+                  !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+                ],
+              ],
+            ]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "cognito-identity:GetCredentialsForIdentity"
+                Resource:
+                  !Join [
+                    ":",
+                    [
+                      "arn:aws:cognito-identity:",
+                      !Ref "AWS::Region",
+                      !Ref "AWS::AccountId",
+                      "identitypool/",
+                      !Ref "AWS::Region",
+                      !Ref IdentityPool,
+                    ],
+                  ]
+
+  CognitoUnauthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action: "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": "unauthenticated"
+      Path: "/"
+      Policies:
+        - PolicyName:
+            !Join [
+              "-",
+              [
+                "unauthenticated-role",
+                !Select [
+                  4,
+                  !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+                ],
+              ],
+            ]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "cognito-identity:GetCredentialsForIdentity"
+                Resource:
+                  !Join [
+                    ":",
+                    [
+                      "arn:aws:cognito-identity:",
+                      !Ref "AWS::Region",
+                      !Ref "AWS::AccountId",
+                      "identitypool/",
+                      !Ref "AWS::Region",
+                      !Ref IdentityPool,
+                    ],
+                  ]
+
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        "authenticated": !GetAtt CognitoAuthenticatedRole.Arn
+        "unauthenticated": !GetAtt CognitoUnauthenticatedRole.Arn
+
+  AmazonOpenSearchServiceCognitoAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "opensearchservice.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonOpenSearchServiceCognitoAccess"
+
+  UpdateCognitoUrlFunction:
+    Type: AWS::Serverless::Function
+    # checkov:skip=CKV_AWS_117:lambda doesn't have to communicate with private resources
+    # checkov:skip=CKV_AWS_115:not for production deployment
+    # checkov:skip=CKV_AWS_116:lambda doesn't process data, error doesn't have to be handled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "lambda doesn't have to communicate with private resources"
+          - id: W92
+            reason: "not for production deployment"
+    Properties:
+      CodeUri: src/cfn-custom-resources/update-cognito-url
+      Policies:
+        - AmazonCognitoPowerUser
+
+  UpdateCognitoUrl:
+    Type: Custom::UpdateCognitoUrl
+    DependsOn:
+      - CloudFrontDistribution
+      - EC2Proxy
+    Properties:
+      ServiceToken: !GetAtt UpdateCognitoUrlFunction.Arn
+      UserPoolId: !Ref UserPool
+      ClientId: !GetAtt GetCognitoClient.ClientId
+      CloudFrontDistributionUrl: !GetAtt CloudFrontDistribution.DomainName
+      EC2ProxyPublicDnsName: !GetAtt EC2Proxy.PublicDnsName
+      Nonce: !Ref Nonce
+
+  OpenSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "logs are encrypted with aws managed key by default, no need of kms"
+    Condition: OpensearchAuditLogs
+    Properties:
+      LogGroupName: opensearch-audit-logs
+      RetentionInDays: 7
+  OpenSearchLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Condition: OpensearchAuditLogs
+    Properties:
+      PolicyName: my-policy
+      PolicyDocument: !Sub '{ "Version": "2012-10-17", "Statement": [{ "Sid": "", "Effect": "Allow", "Principal": { "Service": "es.amazonaws.com"}, "Action":[ "logs:PutLogEvents","logs:CreateLogStream"],"Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:opensearch-audit-logs:*"}]}'
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Application Load Balancer
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateARN
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn:
+      - EC2Proxy
+    Properties:
+      HealthCheckPath: /
+      Name: proxy-target-group
+      Port: 443
+      Protocol: HTTPS
+      TargetType: instance
+      VpcId: !Ref VPCId
+      Targets:
+        - Id: !Ref EC2Proxy
+
+  SSMInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  SSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref SSMInstanceRole
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EC2Proxy:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - InstanceSecurityGroup
+    Properties:
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: 
+            - !Ref InstanceSecurityGroup
+          SubnetId: !Ref PrivateSubnet1
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref "AWS::StackName", "proxy"]]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+      ImageId: ami-0ebfd941bbafe70c6
+      InstanceType: !Ref InstanceType
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            sudo yum update -y
+            sudo yum install -y nginx
+            sudo systemctl start nginx
+            sudo systemctl enable nginx
+
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OpenSearch domain
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  OpensearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    # checkov:skip=CKV_AWS_84:logging not needed for sample application
+    # checkov:skip=CKV_AWS_317:audit logging enabled by user provided parameter "EnableOpensearchAuditLogs"
+    DependsOn:
+      - UserPool
+      - IdentityPool
+      - OpenSearchSecurityGroup
+    Properties:
+      DomainName:
+        !Join [
+          "-",
+          [
+            "os-domain",
+            !Select [
+              4,
+              !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+            ],
+          ],
+        ]
+      #EngineVersion: "OpenSearch_2.15"
+      VPCOptions:
+        SubnetIds: 
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds: 
+          - !Ref OpenSearchSecurityGroup
+      AccessPolicies:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: "es:*"
+            Resource: "*"
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: false
+        MasterUserOptions:
+          MasterUserARN: !GetAtt CognitoAuthenticatedRole.Arn
+      ClusterConfig:
+        InstanceCount: 2
+        InstanceType: "t3.small.search"
+        ZoneAwarenessEnabled: true
+        MultiAZWithStandbyEnabled: false
+        ZoneAwarenessConfig:
+          AvailabilityZoneCount: 2
+      CognitoOptions:
+        Enabled: true
+        IdentityPoolId: !Ref IdentityPool
+        UserPoolId: !Ref UserPool
+        RoleArn: !GetAtt AmazonOpenSearchServiceCognitoAccessRole.Arn
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 10
+        VolumeType: "gp3"
+      EncryptionAtRestOptions:
+        Enabled: true
+      IPAddressType: "ipv4"
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      SoftwareUpdateOptions:
+        AutoSoftwareUpdateEnabled: true
+      LogPublishingOptions:
+        AUDIT_LOGS: !If
+          - OpensearchAuditLogs
+          - CloudWatchLogsLogGroupArn: !GetAtt OpenSearchLogGroup.Arn
+            Enabled: true
+          - Enabled: false
+
+  LambdaEdgeProtection:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: arn:aws:serverlessrepo:us-east-1:520945424137:applications/cloudfront-authorization-at-edge
+        SemanticVersion: !Ref SemanticVersion
+      Parameters:
+        CreateCloudFrontDistribution: "false"
+        HttpHeaders: !Ref HttpHeaderss
+        CookieCompatibility: "elasticsearch"
+        EnableSPAMode: !Ref EnableSPAMode
+        RewritePathWithTrailingSlashToIndex: "true"
+        UserPoolArn: !GetAtt UserPool.Arn
+        UserPoolAuthDomain:
+          !Sub [
+            "auth-${StackIdSuffix}.auth.${AWS::Region}.amazoncognito.com",
+            { StackIdSuffix: !Select [2, !Split ["/", !Ref AWS::StackId]] },
+          ]
+        UserPoolClientId: !GetAtt GetCognitoClient.ClientId
+        UserPoolClientSecret: !GetAtt GetCognitoClient.ClientSecret
+        OAuthScopes: !Join
+          - ","
+          - !Ref OAuthScopes #"phone,email,profile,openid"
+
+Outputs:
+  WebsiteContentBucket:
+    Description: The S3 Bucket where the SPA (React, Angular, Vue, ...) is uploaded to
+    Value: !Ref WebsiteContentBucket
+  IdentityPoolId:
+    Value: !Ref IdentityPool
+    Description: The identity pool ID
+  OpensearchDashboardEndpoint:
+    Value: !Sub "https://${OpensearchDomain.DomainEndpoint}/_dashboards"
+    Description: Opensearch domain endpoint
+  ClientId:
+    Value: !GetAtt GetCognitoClient.ClientId
+    Description: Cognito user pool client ID
+  ClientSecret:
+    Value: !GetAtt GetCognitoClient.ClientSecret
+    Description: Cognito user pool client secret
+  UserPoolDomain:
+    Value:
+      !Sub [
+        "auth-${StackIdSuffix}",
+        { StackIdSuffix: !Select [2, !Split ["/", !Ref AWS::StackId]] },
+      ]
+    Description: Cognito user pool domain
+  DistributionDomaniName:
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}/"
+    Description: CloudFront distribution domain name
