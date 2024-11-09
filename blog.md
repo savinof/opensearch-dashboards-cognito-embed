@@ -178,7 +178,3 @@ While the implementation details might seem complex at first glance, the step-by
 Notably, the Cloudfront Authorization@Edge solution played a crucial role in simplifying the implementation and enabling the reuse of existing code. By leveraging this solution, you’ll be able to implement the desired mechanism efficiently and effectively.
 
 We hope this blog post has provided you with valuable insights and a practical solution for integrating OpenSearch Dashboards into your website using Cognito authentication. Feel free to share your experiences, feedback, or any improvements you've made to the solution in the comments section below.
-
-## About the author
-
-Franco Savino is a Solutions Architect based in Milan, Italy, with a strong focus on data analytics and data engineering. He specializes in designing and implementing data-driven solutions on the AWS cloud, leveraging services for data processing, storage, and visualization.
